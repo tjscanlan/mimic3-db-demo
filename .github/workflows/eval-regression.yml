@@ -37,8 +37,11 @@ jobs:
 
       # NOTEEVENTS.csv must stay in this list even though nothing reads its
       # content downstream -- download_mimic_demo.py's validate_downloads()
-      # unconditionally requires it to exist (REQUIRED_FILES). It's ~0 rows
-      # in the demo release, so including it costs no real time.
+      # unconditionally requires it to exist (REQUIRED_FILES). It downloads
+      # empty (0 data rows) from the demo release, by design: this project
+      # does not pursue MIMIC-III full-credentialed access, so real note
+      # text is permanently out of scope, not a pending TODO. The text/RAG
+      # paths run on synthetic notes generated below instead.
       - name: Download MIMIC-III demo data (restricted table set)
         run: >
           uv run python data/download_mimic_demo.py
@@ -47,6 +50,13 @@ jobs:
 
       - name: Generate synthetic discharge notes
         run: uv run python data/generate_mock_noteevents.py --seed 42
+
+      # Safety net for the above: confirms no real note text slipped in
+      # (e.g. via accidentally-configured PhysioNet credentials) and that
+      # the synthetic notes the text/RAG paths will actually train on are
+      # all explicitly marked as such.
+      - name: Verify notes are synthetic
+        run: uv run python data/verify_synthetic_notes.py
 
       # Fastest/cheapest model first -- fail fast before the slower steps.
       - name: Train structured XGBoost baseline

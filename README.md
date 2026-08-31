@@ -4,7 +4,7 @@ A healthcare ML portfolio project: predict 30-day hospital readmission on the [M
 
 This is a research/education project, not a clinical tool.
 
-**Note on text data:** the MIMIC-III demo ships `NOTEEVENTS.csv` empty — PhysioNet strips discharge-summary text from the demo release; real notes only exist in the full credentialed database. So the text and RAG paths here run on *synthetic* discharge summaries (`data/generate_mock_noteevents.py`), generated from the real structured data with a deliberate artificial correlation baked in. They're pipeline sanity checks, not real findings about text-based readmission prediction — see that script's docstring for details. Likewise, the cohort is only 129 admissions / 11 positives, so treat any subgroup/calibration metric as illustrative rather than statistically defensible.
+**Note on text data:** the MIMIC-III demo ships `NOTEEVENTS.csv` empty — PhysioNet strips discharge-summary text from the demo release; real notes only exist in the full credentialed database, which requires CITI certification this project doesn't pursue. So the text and RAG paths here run on *synthetic* discharge summaries (`data/generate_mock_noteevents.py`), generated from the real structured data with a deliberate artificial correlation baked in — a permanent design choice, not a placeholder awaiting real data. They're pipeline sanity checks, not real findings about text-based readmission prediction — see that script's docstring for details. Likewise, the cohort is only 129 admissions / 11 positives, so treat any subgroup/calibration metric as illustrative rather than statistically defensible.
 
 ## Setup
 
@@ -24,6 +24,10 @@ uv sync
 4. Generate the synthetic discharge notes the text/RAG paths need (also gitignored):
    ```bash
    uv run python data/generate_mock_noteevents.py
+   ```
+5. (Optional) Confirm no real note text is in play — checks the real download stayed empty and every synthetic note carries its marker:
+   ```bash
+   uv run python data/verify_synthetic_notes.py
    ```
 
 ## Exploring the data
