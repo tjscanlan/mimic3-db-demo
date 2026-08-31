@@ -1,0 +1,13 @@
+{
+  "_readme": "Fixed floors for eval_logs metrics, checked by src/eval/check_regression.py on every PR. Computed on the latest logged run per model. These exist to catch code regressions (a broken feature join, a label bug, a flipped sign) -- not to certify these models as clinically useful (n=129/11 positives, see README).",
+  "models": {
+    "structured_xgboost": { "roc_auc_min": 0.50, "pr_auc_min": 0.09, "blocking": true },
+    "text_distilbert_lora": { "roc_auc_min": 0.52, "pr_auc_min": 0.12, "blocking": true },
+    "rag_knn": {
+      "roc_auc_min": 0.35,
+      "pr_auc_min": 0.05,
+      "blocking": false,
+      "_note": "KNOWN ISSUE: current measured roc_auc=0.399 is already below random (0.5), a pre-existing weakness in the retrieval path. This is a 'no further regression' floor on the current baseline, non-blocking so the gate can ship without hiding or blocking on an unrelated issue. Flip to blocking once the retrieval path is fixed and re-baselined."
+    }
+  }
+}

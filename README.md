@@ -66,3 +66,13 @@ uv run python app.py
 ```
 
 The demo checks for the three trained artifacts above on startup and prints the exact commands to generate any that are missing. It never imports `torch`/`transformers` directly — see `app.py`'s docstring for why (an XGBoost/PyTorch OpenMP conflict segfaults when both are loaded in one process) — so text-model predictions are served via a subprocess call to `src/nlp/predict.py`.
+
+## CI
+
+Every PR reruns all three training paths (`.github/workflows/eval-regression.yml`) and fails the build if a model's ROC-AUC or PR-AUC on the current run drops below the fixed floor in `src/eval/thresholds.json`. `rag_knn` is currently a non-blocking (warn-only) check — see that file for why.
+
+Run the same check locally against whatever's already in `eval_logs/`:
+
+```bash
+uv run python -m src.eval.check_regression
+```
