@@ -1,8 +1,10 @@
 # mimic3-db-demo
 
-A healthcare ML portfolio project: predict 30-day hospital readmission on the [MIMIC-III Clinical Database Demo](https://physionet.org/content/mimiciii-demo/1.4/) (public, 100-patient subset from PhysioNet), comparing two parallel approaches on the same patients — structured feature engineering feeding a classic gradient-boosted model, and clinical text feeding a fine-tuned small language model — converging on a shared evaluation harness.
+A healthcare ML portfolio project: predict 30-day hospital readmission on the [MIMIC-III Clinical Database Demo](https://physionet.org/content/mimiciii-demo/1.4/) (public, 100-patient subset from PhysioNet), comparing three parallel approaches on the same patients — structured feature engineering feeding an XGBoost model, clinical text feeding a fine-tuned DistilBERT+LoRA classifier, and k-NN retrieval over note embeddings — converging on a shared evaluation harness. A Gradio demo ties all three together.
 
 This is a research/education project, not a clinical tool.
+
+**Note on text data:** the MIMIC-III demo ships `NOTEEVENTS.csv` empty — PhysioNet strips discharge-summary text from the demo release; real notes only exist in the full credentialed database. So the text and RAG paths here run on *synthetic* discharge summaries (`data/generate_mock_noteevents.py`), generated from the real structured data with a deliberate artificial correlation baked in. They're pipeline sanity checks, not real findings about text-based readmission prediction — see that script's docstring for details. Likewise, the cohort is only 129 admissions / 11 positives, so treat any subgroup/calibration metric as illustrative rather than statistically defensible.
 
 ## Setup
 
@@ -19,11 +21,48 @@ uv sync
    uv run python data/download_mimic_demo.py
    ```
    It's safe to re-run — already-downloaded files are skipped. Raw CSVs land in `data/raw/`, which is gitignored; **raw MIMIC data is never committed**.
-
-**Note:** the demo release ships `NOTEEVENTS.csv` empty (header only) — PhysioNet strips discharge-summary text from the demo; it's only available in the full credentialed MIMIC-III database. The download script and EDA notebook both flag this explicitly.
+4. Generate the synthetic discharge notes the text/RAG paths need (also gitignored):
+   ```bash
+   uv run python data/generate_mock_noteevents.py
+   ```
 
 ## Exploring the data
 
 ```bash
 uv run jupyter lab notebooks/01_eda.ipynb
 ```
+
+## Training the models
+
+Each script runs stratified k-fold CV and logs every fold's predictions to `eval_logs/*.jsonl`. Pass `--save-model-dir` / `--save-adapter-dir` (or, for the RAG index, just run `build_index`) to also produce the artifact the Gradio demo loads for live inference.
+
+```bash
+# Structured path: XGBoost on ADMISSIONS/PATIENTS/DIAGNOSES_ICD features
+uv run python -m src.models.train_baseline --save-model-dir models/structured_xgboost
+
+# Text path: DistilBERT + LoRA fine-tuned on synthetic note text
+uv run python -m src.models.train_slm --save-adapter-dir models/text_distilbert_lora
+
+# RAG path: builds the note-embedding index, then evaluates k-NN retrieval-as-classifier over it.
+# The index itself (not a trained model file) is the deployable artifact.
+uv run python -m src.rag.build_index
+uv run python -m src.models.train_rag
+```
+
+Each script accepts `--help` for its full option list (data dir, number of folds, seed, etc.).
+
+## Evaluating results
+
+```bash
+uv run jupyter lab notebooks/02_baseline_model.ipynb   # structured path
+uv run jupyter lab notebooks/03_slm_baseline.ipynb     # text path
+uv run jupyter lab notebooks/04_eval_harness.ipynb     # subgroup / calibration / drift, across eval_logs/
+```
+
+## Running the demo
+
+```bash
+uv run python app.py
+```
+
+The demo checks for the three trained artifacts above on startup and prints the exact commands to generate any that are missing. It never imports `torch`/`transformers` directly — see `app.py`'s docstring for why (an XGBoost/PyTorch OpenMP conflict segfaults when both are loaded in one process) — so text-model predictions are served via a subprocess call to `src/nlp/predict.py`.
