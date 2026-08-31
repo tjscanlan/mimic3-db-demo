@@ -71,6 +71,10 @@ def main() -> int:
     parser.add_argument("--data-dir", default="data/raw", type=Path)
     parser.add_argument("--n-splits", default=5, type=int)
     parser.add_argument("--seed", default=42, type=int)
+    parser.add_argument(
+        "--json-out", default=None, type=Path,
+        help="Optional path to write the per-fold report as JSON (for cross-process callers).",
+    )
     args = parser.parse_args()
 
     df = build_feature_table(args.data_dir)
@@ -89,6 +93,8 @@ def main() -> int:
         report["roc_auc"].mean(), report["roc_auc"].std(),
         report["pr_auc"].mean(), report["pr_auc"].std(),
     )
+    if args.json_out:
+        report.to_json(args.json_out, orient="records")
     return 0
 
 
