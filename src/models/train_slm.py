@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from dotenv import load_dotenv
 from peft import LoraConfig, TaskType, get_peft_model
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -33,6 +34,12 @@ from src.nlp.preprocess import NoteDataset, load_notes_with_labels
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+# Picks up HF_TOKEN from .env (if present) into the process environment --
+# huggingface_hub reads HF_TOKEN automatically from there for higher rate
+# limits/faster downloads (and it's required for any gated model). No other
+# wiring needed; must run before any from_pretrained() call.
+load_dotenv()
 
 MODEL_NAME = "distilbert-base-uncased"
 
