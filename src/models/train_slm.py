@@ -13,6 +13,7 @@ import argparse
 import logging
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,10 +31,13 @@ from transformers import (
     TrainingArguments,
 )
 
+from src.eval.logger import log_predictions
 from src.nlp.preprocess import NoteDataset, load_notes_with_labels
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+EVAL_MODEL_ID = "text_distilbert_lora"
 
 # Picks up HF_TOKEN from .env (if present) into the process environment --
 # huggingface_hub reads HF_TOKEN automatically from there for higher rate
@@ -90,13 +94,15 @@ def run_cv(
     max_length: int = 128,
     lr: float = 2e-4,
     batch_size: int = 8,
-) -> tuple[pd.DataFrame, list]:
+    return_predictions: bool = False,
+) -> tuple[pd.DataFrame, list] | tuple[pd.DataFrame, list, pd.DataFrame]:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     texts, labels = df["text"].tolist(), df["readmit_30d"].tolist()
+    hadm_ids = df["hadm_id"].tolist()
     y = np.array(labels)
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    rows, models = [], []
+    rows, pred_rows, models = [], [], []
 
     for fold, (train_idx, test_idx) in enumerate(skf.split(texts, y), start=1):
         train_texts = [texts[i] for i in train_idx]
@@ -133,7 +139,11 @@ def run_cv(
                 class_weights=class_weights,
             )
             trainer.train()
+            # Timed as one batched trainer.predict() call -- same
+            # per-fold-average approximation as train_baseline.py.
+            t0 = time.perf_counter()
             preds = trainer.predict(test_ds)
+            latency_ms = (time.perf_counter() - t0) * 1000 / len(test_labels)
 
         models.append(model)
         probs = torch.softmax(torch.tensor(preds.predictions), dim=1)[:, 1].numpy()
@@ -147,7 +157,20 @@ def run_cv(
             }
         )
         log.info("fold %d: roc_auc=%.3f pr_auc=%.3f", fold, rows[-1]["roc_auc"], rows[-1]["pr_auc"])
+        if return_predictions:
+            for idx, yt, yp in zip(test_idx, test_labels, probs):
+                pred_rows.append(
+                    {
+                        "fold": fold,
+                        "hadm_id": int(hadm_ids[idx]),
+                        "y_true": int(yt),
+                        "y_prob": float(yp),
+                        "latency_ms": latency_ms,
+                    }
+                )
 
+    if return_predictions:
+        return pd.DataFrame(rows), models, pd.DataFrame(pred_rows)
     return pd.DataFrame(rows), models
 
 
@@ -174,7 +197,7 @@ def main() -> int:
         len(df), df["readmit_30d"].sum(), 100 * df["readmit_30d"].mean(),
     )
 
-    report, _ = run_cv(
+    report, _, predictions = run_cv(
         df,
         n_splits=args.n_splits,
         seed=args.seed,
@@ -182,6 +205,7 @@ def main() -> int:
         max_length=args.max_length,
         lr=args.lr,
         batch_size=args.batch_size,
+        return_predictions=True,
     )
     log.info("\n%s", report.to_string(index=False))
     log.info(
@@ -189,6 +213,9 @@ def main() -> int:
         report["roc_auc"].mean(), report["roc_auc"].std(),
         report["pr_auc"].mean(), report["pr_auc"].std(),
     )
+
+    log_path = log_predictions(predictions, model=EVAL_MODEL_ID)
+    log.info("logged %d predictions to %s", len(predictions), log_path)
     return 0
 
 

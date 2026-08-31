@@ -7,6 +7,7 @@ Usage:
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -14,10 +15,13 @@ import xgboost as xgb
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import average_precision_score, roc_auc_score
 
+from src.eval.logger import log_predictions
 from src.features.build_dataset import NON_FEATURE_COLS, build_feature_table
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+EVAL_MODEL_ID = "structured_xgboost"
 
 
 def make_model(seed: int, scale_pos_weight: float) -> xgb.XGBClassifier:
@@ -35,11 +39,23 @@ def make_model(seed: int, scale_pos_weight: float) -> xgb.XGBClassifier:
 
 
 def run_cv(
-    X: pd.DataFrame, y: pd.Series, n_splits: int = 5, seed: int = 42
-) -> tuple[pd.DataFrame, list[xgb.XGBClassifier]]:
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int = 5,
+    seed: int = 42,
+    hadm_ids: pd.Series | None = None,
+    return_predictions: bool = False,
+) -> (
+    tuple[pd.DataFrame, list[xgb.XGBClassifier]]
+    | tuple[pd.DataFrame, list[xgb.XGBClassifier], pd.DataFrame]
+):
+    if return_predictions and hadm_ids is None:
+        raise ValueError("hadm_ids is required when return_predictions=True")
+
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     rows = []
+    pred_rows = []
     models = []
     for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -52,7 +68,13 @@ def run_cv(
         model.fit(X_train, y_train)
         models.append(model)
 
+        # Timed as one batched predict_proba() call -- no true single-example
+        # latency is available; wall time is divided evenly across this
+        # fold's test rows as an approximation (documented, not hidden).
+        t0 = time.perf_counter()
         y_score = model.predict_proba(X_test)[:, 1]
+        latency_ms = (time.perf_counter() - t0) * 1000 / len(X_test)
+
         rows.append(
             {
                 "fold": fold,
@@ -62,7 +84,14 @@ def run_cv(
                 "pr_auc": average_precision_score(y_test, y_score),
             }
         )
+        if return_predictions:
+            for hid, yt, yp in zip(hadm_ids.iloc[test_idx].to_numpy(), y_test.to_numpy(), y_score):
+                pred_rows.append(
+                    {"fold": fold, "hadm_id": int(hid), "y_true": int(yt), "y_prob": float(yp), "latency_ms": latency_ms}
+                )
 
+    if return_predictions:
+        return pd.DataFrame(rows), models, pd.DataFrame(pred_rows)
     return pd.DataFrame(rows), models
 
 
@@ -86,7 +115,9 @@ def main() -> int:
         len(df), len(feature_cols), y.sum(), 100 * y.mean(),
     )
 
-    report, _ = run_cv(X, y, n_splits=args.n_splits, seed=args.seed)
+    report, _, predictions = run_cv(
+        X, y, n_splits=args.n_splits, seed=args.seed, hadm_ids=df["hadm_id"], return_predictions=True
+    )
     log.info("\n%s", report.to_string(index=False))
     log.info(
         "\nroc_auc  mean=%.3f std=%.3f\npr_auc   mean=%.3f std=%.3f",
@@ -95,6 +126,9 @@ def main() -> int:
     )
     if args.json_out:
         report.to_json(args.json_out, orient="records")
+
+    log_path = log_predictions(predictions, model=EVAL_MODEL_ID)
+    log.info("logged %d predictions to %s", len(predictions), log_path)
     return 0
 
 
