@@ -24,6 +24,7 @@ import xgboost as xgb
 from src.features.build_dataset import build_feature_table
 from src.features.patient_summary import build_patient_summary_table
 from src.nlp.preprocess import load_notes_with_labels
+from src.rag.knn import knn_predict, load_index
 
 MODELS_DIR = Path("models")
 STRUCTURED_MODEL_ID = "structured_xgboost"
@@ -32,6 +33,9 @@ STRUCTURED_MODEL_DIR = MODELS_DIR / STRUCTURED_MODEL_ID
 # module cannot be imported here, it pulls in torch at module load.
 TEXT_MODEL_ID = "text_distilbert_lora"
 TEXT_ADAPTER_DIR = MODELS_DIR / TEXT_MODEL_ID
+RAG_MODEL_ID = "rag_knn"
+RAG_INDEX_DIR = MODELS_DIR / RAG_MODEL_ID
+RAG_K = 5
 
 
 def check_prerequisites() -> None:
@@ -44,6 +48,8 @@ def check_prerequisites() -> None:
         missing.append(f"uv run python -m src.models.train_baseline --save-model-dir {STRUCTURED_MODEL_DIR}")
     if not (TEXT_ADAPTER_DIR / "adapter_config.json").exists():
         missing.append(f"uv run python -m src.models.train_slm --save-adapter-dir {TEXT_ADAPTER_DIR}")
+    if not (RAG_INDEX_DIR / "meta.json").exists():
+        missing.append("uv run python -m src.rag.build_index")
     if missing:
         print("Missing prerequisite(s). Run, in order:\n  " + "\n  ".join(missing), file=sys.stderr)
         sys.exit(1)
@@ -60,6 +66,9 @@ feature_cols = meta["feature_cols"]
 
 xgb_model = xgb.XGBClassifier()
 xgb_model.load_model(STRUCTURED_MODEL_DIR / "model.json")
+
+rag_index = load_index(RAG_INDEX_DIR)
+rag_labels = features_df["readmit_30d"]
 
 HADM_IDS = sorted(features_df.index.tolist())
 
@@ -101,17 +110,26 @@ def run_admission(hadm_id: int):
     structured_prob = float(xgb_model.predict_proba(X_row)[0, 1])
     structured_label = {"Readmit <=30d": structured_prob, "No readmit": 1 - structured_prob}
 
+    rag_prob, neighbors_df = knn_predict(
+        hadm_id, rag_index.embeddings, rag_index.hadm_ids, rag_labels, k=RAG_K
+    )
+    rag_label = {"Readmit <=30d": rag_prob, "No readmit": 1 - rag_prob}
+    neighbors_df = neighbors_df.rename(columns={"readmit_30d": "readmitted_30d"})
+    neighbors_df["similarity"] = neighbors_df["similarity"].round(3)
+
     yield (
         summary_md,
         note_text,
         ground_truth_md,
         structured_label,
         gr.update(value=None, label="Text model (running -- subprocess cold start, a few seconds)..."),
+        rag_label,
+        neighbors_df,
     )
 
     text_prob = predict_text_confidence(hadm_id)
     text_label = {"Readmit <=30d": text_prob, "No readmit": 1 - text_prob}
-    yield (summary_md, note_text, ground_truth_md, structured_label, text_label)
+    yield (summary_md, note_text, ground_truth_md, structured_label, text_label, rag_label, neighbors_df)
 
 
 with gr.Blocks(title="MIMIC-III Readmission Demo") as demo:
@@ -119,11 +137,18 @@ with gr.Blocks(title="MIMIC-III Readmission Demo") as demo:
         "## 30-Day Readmission Prediction Demo\n"
         "**Research/education portfolio project only -- not a clinical tool.** "
         "Predictions are from models trained on the small (129-admission) MIMIC-III "
-        "Clinical Database *Demo* and should never inform real clinical decisions."
+        "Clinical Database *Demo*, now compared against a k-NN retrieval classifier "
+        "over note embeddings, and should never inform real clinical decisions."
     )
     with gr.Row():
         dropdown = gr.Dropdown(choices=HADM_IDS, label="Select admission (hadm_id)")
         random_btn = gr.Button("Random admission")
+
+    model_toggle = gr.CheckboxGroup(
+        choices=["Structured (XGBoost)", "Text (DistilBERT + LoRA)", "Retrieval k-NN"],
+        value=["Structured (XGBoost)", "Text (DistilBERT + LoRA)", "Retrieval k-NN"],
+        label="Show/hide model predictions",
+    )
 
     with gr.Row():
         summary_out = gr.Markdown(label="Patient / admission summary")
@@ -139,10 +164,26 @@ with gr.Blocks(title="MIMIC-III Readmission Demo") as demo:
 
     ground_truth_out = gr.Markdown()
     with gr.Row():
-        structured_out = gr.Label(label="Structured model (XGBoost)")
-        text_out = gr.Label(label="Text model (DistilBERT + LoRA)")
+        with gr.Column(visible=True) as structured_col:
+            structured_out = gr.Label(label="Structured model (XGBoost)")
+        with gr.Column(visible=True) as text_col:
+            text_out = gr.Label(label="Text model (DistilBERT + LoRA)")
+        with gr.Column(visible=True) as rag_col:
+            rag_out = gr.Label(label="Retrieval k-NN model")
+            gr.Markdown(
+                "**Retrieved evidence** -- top-k most similar SYNTHETIC notes "
+                "(excluding this admission). Notes were generated with a "
+                "deliberate label-correlated phrasing pattern (see "
+                "`data/generate_mock_noteevents.py`), so retrieval trivially "
+                "finds notes sharing that injected phrasing -- expected "
+                "pipeline behavior, not a discovered clinical insight."
+            )
+            rag_evidence_out = gr.Dataframe(
+                label=f"Top-{RAG_K} nearest neighbor notes",
+                headers=["hadm_id", "similarity", "readmitted_30d"],
+            )
 
-    outputs = [summary_out, note_out, ground_truth_out, structured_out, text_out]
+    outputs = [summary_out, note_out, ground_truth_out, structured_out, text_out, rag_out, rag_evidence_out]
     dropdown.change(run_admission, inputs=dropdown, outputs=outputs)
     random_btn.click(lambda: random.choice(HADM_IDS), outputs=dropdown).then(
         run_admission, inputs=dropdown, outputs=outputs
@@ -150,6 +191,15 @@ with gr.Blocks(title="MIMIC-III Readmission Demo") as demo:
     demo.load(lambda: random.choice(HADM_IDS), outputs=dropdown).then(
         run_admission, inputs=dropdown, outputs=outputs
     )
+
+    def toggle_columns(selected: list[str]):
+        return (
+            gr.update(visible="Structured (XGBoost)" in selected),
+            gr.update(visible="Text (DistilBERT + LoRA)" in selected),
+            gr.update(visible="Retrieval k-NN" in selected),
+        )
+
+    model_toggle.change(toggle_columns, inputs=model_toggle, outputs=[structured_col, text_col, rag_col])
 
 if __name__ == "__main__":
     demo.launch()
