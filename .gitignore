@@ -224,3 +224,7 @@ CLAUDE.md
 # Raw MIMIC-III data (never commit — PHI-adjacent, pulled via data/download_mimic_demo.py)
 data/raw/*
 !data/raw/.gitkeep
+
+# Generated data, including synthetic/mock data (never commit — keep data/ to scripts only)
+data/mock/*
+!data/mock/.gitkeep
