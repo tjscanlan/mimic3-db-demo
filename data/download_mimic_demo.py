@@ -67,22 +67,6 @@ KNOWN_EMPTY_FILES = {
 }
 
 
-# TODO(human): implement credential resolution.
-#
-# Resolve PhysioNet HTTP basic-auth credentials, trying each source in turn,
-# and return a `requests.auth.HTTPBasicAuth` instance — or `None` if no
-# credentials are configured (this dataset works fine unauthenticated today).
-#
-# Sources to check, in order:
-#   1. PHYSIONET_USER / PHYSIONET_PASS environment variables — use them if
-#      BOTH are set.
-#   2. A `physionet.org` entry in ~/.netrc (the stdlib `netrc` module parses
-#      this) — use it if present.
-#   3. Otherwise return None, and log at INFO level that the download will
-#      proceed unauthenticated.
-#
-# Think about the edge case where only one of PHYSIONET_USER/PHYSIONET_PASS
-# is set — silently ignoring it could hide a typo'd env var name.
 def get_auth() -> requests.auth.HTTPBasicAuth | None:
     if os.environ.get("PHYSIONET_USER") and not os.environ.get("PHYSIONET_PASS"):
         log.warning(
