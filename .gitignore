@@ -219,3 +219,8 @@ __marimo__/
 
 # Personal settings
 docs/initial_startup.md
+CLAUDE.md
+
+# Raw MIMIC-III data (never commit — PHI-adjacent, pulled via data/download_mimic_demo.py)
+data/raw/*
+!data/raw/.gitkeep
