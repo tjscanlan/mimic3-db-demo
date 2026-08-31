@@ -228,3 +228,7 @@ data/raw/*
 # Generated data, including synthetic/mock data (never commit — keep data/ to scripts only)
 data/mock/*
 !data/mock/.gitkeep
+
+# Trained model artifacts (never commit — regenerable build output, not source)
+models/*
+!models/.gitkeep

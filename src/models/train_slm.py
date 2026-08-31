@@ -32,7 +32,8 @@ from transformers import (
 )
 
 from src.eval.logger import log_predictions
-from src.nlp.preprocess import NoteDataset, load_notes_with_labels
+from src.nlp.dataset import NoteDataset
+from src.nlp.preprocess import load_notes_with_labels
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -174,6 +175,53 @@ def run_cv(
     return pd.DataFrame(rows), models
 
 
+def train_final_model(
+    df: pd.DataFrame,
+    seed: int = 42,
+    epochs: int = 5,
+    max_length: int = 128,
+    lr: float = 2e-4,
+    batch_size: int = 8,
+):
+    """Fit one model on the FULL cohort (no CV split) for live inference/serving."""
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    texts, labels = df["text"].tolist(), df["readmit_30d"].tolist()
+    train_ds = NoteDataset(texts, labels, tokenizer, max_length)
+
+    n_pos = sum(labels)
+    n_neg = len(labels) - n_pos
+    class_weights = torch.tensor(
+        [len(labels) / (2 * n_neg), len(labels) / (2 * n_pos)], dtype=torch.float
+    )
+
+    model = make_model(seed)
+    with tempfile.TemporaryDirectory() as out_dir:
+        training_args = TrainingArguments(
+            output_dir=out_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            learning_rate=lr,
+            logging_strategy="no",
+            save_strategy="no",
+            report_to=[],
+            seed=seed,
+        )
+        trainer = WeightedLossTrainer(
+            model=model, args=training_args, train_dataset=train_ds, class_weights=class_weights
+        )
+        trainer.train()
+
+    return model, tokenizer
+
+
+def save_final_model(model, tokenizer, out_dir: Path) -> Path:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    return out_dir
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="data/raw", type=Path)
@@ -184,6 +232,11 @@ def main() -> int:
     parser.add_argument("--max-length", default=128, type=int)
     parser.add_argument("--lr", default=2e-4, type=float)
     parser.add_argument("--batch-size", default=8, type=int)
+    parser.add_argument(
+        "--save-adapter-dir", default=None, type=Path,
+        help=f"Optional: also fit a final model on the FULL cohort (no CV split) and save the "
+             f"LoRA adapter here for live inference, e.g. models/{EVAL_MODEL_ID}",
+    )
     args = parser.parse_args()
 
     log.warning(
@@ -216,6 +269,14 @@ def main() -> int:
 
     log_path = log_predictions(predictions, model=EVAL_MODEL_ID)
     log.info("logged %d predictions to %s", len(predictions), log_path)
+
+    if args.save_adapter_dir:
+        final_model, final_tokenizer = train_final_model(
+            df, seed=args.seed, epochs=args.epochs, max_length=args.max_length,
+            lr=args.lr, batch_size=args.batch_size,
+        )
+        saved_dir = save_final_model(final_model, final_tokenizer, args.save_adapter_dir)
+        log.info("saved final adapter to %s", saved_dir)
     return 0
 
 

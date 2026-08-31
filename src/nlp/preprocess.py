@@ -9,8 +9,6 @@ import re
 from pathlib import Path
 
 import pandas as pd
-import torch
-from torch.utils.data import Dataset
 
 from src.features.build_dataset import compute_label, load_raw_tables
 
@@ -39,21 +37,3 @@ def load_notes_with_labels(
     df = notes[["hadm_id", "subject_id", "text"]].merge(label, on="hadm_id", how="inner")
     df["text"] = df["text"].map(clean_text)
     return df.reset_index(drop=True)
-
-
-class NoteDataset(Dataset):
-    """Eagerly tokenizes text; returns a Trainer-compatible dict per item."""
-
-    def __init__(self, texts: list[str], labels: list[int], tokenizer, max_length: int = 128):
-        self.encodings = tokenizer(
-            texts, truncation=True, padding="max_length", max_length=max_length
-        )
-        self.labels = labels
-
-    def __len__(self) -> int:
-        return len(self.labels)
-
-    def __getitem__(self, idx: int) -> dict:
-        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
-        item["labels"] = torch.tensor(self.labels[idx])
-        return item

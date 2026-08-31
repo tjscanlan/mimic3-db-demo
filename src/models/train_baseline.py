@@ -5,9 +5,11 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -95,6 +97,37 @@ def run_cv(
     return pd.DataFrame(rows), models
 
 
+def train_final_model(
+    data_dir: Path = Path("data/raw"), seed: int = 42
+) -> tuple[xgb.XGBClassifier, list[str]]:
+    """Fit one model on the FULL cohort (no CV split) for live inference/serving."""
+    df = build_feature_table(data_dir)
+    feature_cols = [c for c in df.columns if c not in NON_FEATURE_COLS]
+    X, y = df[feature_cols], df["readmit_30d"]
+
+    n_pos = y.sum()
+    scale_pos_weight = (len(y) - n_pos) / n_pos
+    model = make_model(seed, scale_pos_weight)
+    model.fit(X, y)
+    return model, feature_cols
+
+
+def save_final_model(model: xgb.XGBClassifier, feature_cols: list[str], out_dir: Path) -> Path:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_dir / "model.json"
+    model.save_model(model_path)
+    (out_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "feature_cols": feature_cols,
+                "trained_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    )
+    return model_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="data/raw", type=Path)
@@ -103,6 +136,11 @@ def main() -> int:
     parser.add_argument(
         "--json-out", default=None, type=Path,
         help="Optional path to write the per-fold report as JSON (for cross-process callers).",
+    )
+    parser.add_argument(
+        "--save-model-dir", default=None, type=Path,
+        help=f"Optional: also fit a final model on the FULL cohort (no CV split) and save it "
+             f"here for live inference, e.g. models/{EVAL_MODEL_ID}",
     )
     args = parser.parse_args()
 
@@ -129,6 +167,11 @@ def main() -> int:
 
     log_path = log_predictions(predictions, model=EVAL_MODEL_ID)
     log.info("logged %d predictions to %s", len(predictions), log_path)
+
+    if args.save_model_dir:
+        final_model, final_feature_cols = train_final_model(args.data_dir, seed=args.seed)
+        saved_path = save_final_model(final_model, final_feature_cols, args.save_model_dir)
+        log.info("saved final model to %s", saved_path)
     return 0
 
 
