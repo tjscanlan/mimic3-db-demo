@@ -18,9 +18,12 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+load_dotenv()
 
 DEFAULT_BASE_URL = "https://physionet.org/files/mimiciii-demo/1.4/"
 
