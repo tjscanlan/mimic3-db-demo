@@ -24,6 +24,7 @@ A log of the architecturally significant decisions made building this project, i
 18. [CI restricts the PhysioNet download to tables the code actually reads](#adr-018)
 19. [The regression gate script never imports xgboost or torch](#adr-019)
 20. [CI verifies notes are synthetic as a defense-in-depth check](#adr-020)
+21. [Cost/latency dashboard: illustrative $ estimate, benchmark + live-accumulation data, a separate log stream](#adr-021)
 
 ---
 
@@ -284,3 +285,21 @@ A log of the architecturally significant decisions made building this project, i
 **Decision:** `data/verify_synthetic_notes.py`, run as a CI step right after note generation and before any training: asserts the real download's `NOTEEVENTS.csv` still has 0 data rows (i.e., no credentials somehow got configured and pulled real content), and that every row of the synthetic `NOTEEVENTS.csv` starts with `SYNTHETIC_MARKER` (ADR-006). Exits non-zero and fails the build if either check fails.
 
 **Consequences:** This asserts the outcome that actually matters (no real text in play) rather than a proxy for it (no credentials configured) — durable even if something upstream changes (e.g., `PHYSIONET_USER`/`PHYSIONET_PASS` ever got added as repo secrets for an unrelated reason). Adds one fast, cheap CI step in exchange for that guarantee.
+
+---
+
+<a id="adr-021"></a>
+## ADR-021: Cost/latency dashboard: illustrative $ estimate, benchmark + live-accumulation data, a separate log stream
+
+**Status:** Accepted
+
+**Context:** ADR-001–ADR-004 established a shared harness for comparing model *accuracy*, but nothing measured the cost of actually serving a prediction — a real gap given ADR-009's subprocess-per-request pattern for the text path is a meaningfully different cost profile than the in-process XGBoost and k-NN paths. This project has no billed inference API to pull real dollar costs from, and a demo dashboard opened cold with zero data makes a weak first impression.
+
+**Decision:** Three sub-decisions, made together:
+- **Cost model:** `src/eval/cost_logger.py::estimate_cost_usd()` converts measured latency through a hand-picked, clearly-labeled `REFERENCE_INSTANCE_HOURLY_USD` constant (illustrative, ~a small general-purpose cloud CPU instance) rather than a relative-units-only or latency-only framing — a concrete, relatable number, at the cost of it looking more precise than it is if the labeling is ever stripped out. The UI and module docstring both say explicitly that this isn't real billing data.
+- **Data source:** `src/eval/run_cost_benchmark.py` runs a one-time sample (`--n-samples`, default 20) through all three paths and logs every prediction's latency/cost, so the dashboard has a real distribution to show immediately; every live click in the demo's Patient Explorer tab (`app.py::run_admission`) appends more samples to the same per-model log afterward via `src/serving.py`'s latency-measuring predict functions.
+- **Log separation:** cost/latency samples go to a new `cost_logs/{model}.jsonl` stream (`src/eval/cost_logger.py`), not `eval_logs/` — different purpose (production-cost dashboard vs. CV-accuracy regression gate), different shape (continuously-appended per-model file vs. one-file-per-CV-run), and keeping them apart means a cost sample can never affect `check_regression.py`'s "latest run per model" logic (ADR-013).
+
+Confirmed empirically running the benchmark script: structured XGBoost (~1.2ms) and RAG k-NN (~0.3ms) are sub-millisecond in-process calls, while the text path's subprocess-per-request pattern costs ~2,800–4,200ms per prediction — a real, roughly four-orders-of-magnitude latency gap, exactly the "worth it in production" signal this dashboard exists to surface (and a direct, measured consequence of ADR-007/ADR-009's process-isolation design).
+
+**Consequences:** `src/serving.py` was extracted as a new shared module (model loading + single-admission prediction with latency timing) so `app.py` and `run_cost_benchmark.py` don't duplicate that logic — both are now thin callers over it. `cost_logs/` is gitignored like `data/raw`, `data/mock`, and `models/` (regenerable, and — unlike `eval_logs/` — meant to grow indefinitely with local usage rather than serve as shared committed history), so a fresh checkout's dashboard is empty until the benchmark script runs. The aggregation that joins `cost_logs/` latency/cost with `eval_logs/` accuracy into the dashboard's comparison table and chart (`src/eval/cost_dashboard.py::build_dashboard_data`) is where the remaining real judgment calls live (which percentile to show, how to scale cost to something legible, chart encoding) and was left as a human-authored contribution rather than fully scaffolded.

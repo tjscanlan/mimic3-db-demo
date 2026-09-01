@@ -71,6 +71,12 @@ uv run python app.py
 
 The demo checks for the three trained artifacts above on startup and prints the exact commands to generate any that are missing. It never imports `torch`/`transformers` directly — see `app.py`'s docstring for why (an XGBoost/PyTorch OpenMP conflict segfaults when both are loaded in one process) — so text-model predictions are served via a subprocess call to `src/nlp/predict.py`.
 
+The demo's **Cost / Latency Dashboard** tab compares all three paths on more than accuracy — latency and an illustrative estimated cost per prediction, so the comparison includes what a model would actually cost to run in production. It's empty on a fresh checkout; seed it once with a small benchmark sweep (grows further with every prediction you make in the Patient Explorer tab):
+
+```bash
+uv run python -m src.eval.run_cost_benchmark
+```
+
 ## CI
 
 Every PR reruns all three training paths (`.github/workflows/eval-regression.yml`) and fails the build if a model's ROC-AUC or PR-AUC on the current run drops below the fixed floor in `src/eval/thresholds.json`. `rag_knn` is currently a non-blocking (warn-only) check — see that file for why.

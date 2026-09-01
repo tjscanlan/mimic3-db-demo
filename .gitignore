@@ -232,3 +232,9 @@ data/mock/*
 # Trained model artifacts (never commit — regenerable build output, not source)
 models/*
 !models/.gitkeep
+
+# Cost/latency samples from the app.py dashboard (never commit — regenerable
+# via src/eval/run_cost_benchmark.py, and grows continuously with local demo
+# usage; unlike eval_logs/ this isn't meant to be a shared history)
+cost_logs/*
+!cost_logs/.gitkeep

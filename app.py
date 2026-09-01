@@ -5,37 +5,34 @@ xgboost (Homebrew libomp) + torch (bundled OpenMP) in one process segfaults
 (confirmed via macOS crash reports, see src/models/train_slm.py history).
 Text-model predictions are served by shelling out to
 `uv run python -m src.nlp.predict` as a fresh subprocess per request.
+Model loading and single-admission prediction (with latency measurement)
+live in src/serving.py, shared with src/eval/run_cost_benchmark.py.
 
 Usage:
     uv run python app.py
 """
 
-import json
 import random
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import gradio as gr
 import pandas as pd
-import xgboost as xgb
 
-from src.features.build_dataset import build_feature_table
+from src.eval.cost_dashboard import build_dashboard_data
+from src.eval.cost_logger import log_cost_sample
 from src.features.patient_summary import build_patient_summary_table
 from src.nlp.preprocess import load_notes_with_labels
-from src.rag.knn import knn_predict, load_index
-
-MODELS_DIR = Path("models")
-STRUCTURED_MODEL_ID = "structured_xgboost"
-STRUCTURED_MODEL_DIR = MODELS_DIR / STRUCTURED_MODEL_ID
-# Mirrors src/models/train_slm.py's EVAL_MODEL_ID by convention only -- that
-# module cannot be imported here, it pulls in torch at module load.
-TEXT_MODEL_ID = "text_distilbert_lora"
-TEXT_ADAPTER_DIR = MODELS_DIR / TEXT_MODEL_ID
-RAG_MODEL_ID = "rag_knn"
-RAG_INDEX_DIR = MODELS_DIR / RAG_MODEL_ID
-RAG_K = 5
+from src.serving import (
+    RAG_INDEX_DIR,
+    RAG_K,
+    STRUCTURED_MODEL_DIR,
+    TEXT_ADAPTER_DIR,
+    load_all_models,
+    predict_rag,
+    predict_structured,
+    predict_text,
+)
 
 
 def check_prerequisites() -> None:
@@ -57,38 +54,12 @@ def check_prerequisites() -> None:
 
 check_prerequisites()
 
-features_df = build_feature_table().set_index("hadm_id", drop=False)
+models = load_all_models()
+features_df = models.features_df
 summary_df = build_patient_summary_table().set_index("hadm_id")
 notes_df = load_notes_with_labels().set_index("hadm_id")
 
-meta = json.loads((STRUCTURED_MODEL_DIR / "meta.json").read_text())
-feature_cols = meta["feature_cols"]
-
-xgb_model = xgb.XGBClassifier()
-xgb_model.load_model(STRUCTURED_MODEL_DIR / "model.json")
-
-rag_index = load_index(RAG_INDEX_DIR)
-rag_labels = features_df["readmit_30d"]
-
 HADM_IDS = sorted(features_df.index.tolist())
-
-
-def predict_text_confidence(hadm_id: int, timeout: int = 60) -> float:
-    with tempfile.TemporaryDirectory() as tmp:
-        out_path = Path(tmp) / "pred.json"
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "src.nlp.predict",
-                "--hadm-id", str(hadm_id),
-                "--adapter-dir", str(TEXT_ADAPTER_DIR),
-                "--json-out", str(out_path),
-            ],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        payload = json.loads(out_path.read_text()) if out_path.exists() else {"error": result.stderr.strip()}
-    if "error" in payload:
-        raise gr.Error(f"Text-model prediction failed: {payload['error']}")
-    return payload["confidence"]
 
 
 def run_admission(hadm_id: int):
@@ -106,13 +77,12 @@ def run_admission(hadm_id: int):
     )
     ground_truth_md = f"**Ground truth -- readmitted within 30 days:** {'YES' if ground_truth else 'NO'}"
 
-    X_row = features_df.loc[[hadm_id], feature_cols]
-    structured_prob = float(xgb_model.predict_proba(X_row)[0, 1])
+    structured_prob, structured_latency_ms = predict_structured(models, hadm_id)
+    log_cost_sample("structured_xgboost", hadm_id, structured_latency_ms, source="live")
     structured_label = {"Readmit <=30d": structured_prob, "No readmit": 1 - structured_prob}
 
-    rag_prob, neighbors_df = knn_predict(
-        hadm_id, rag_index.embeddings, rag_index.hadm_ids, rag_labels, k=RAG_K
-    )
+    rag_prob, neighbors_df, rag_latency_ms = predict_rag(models, hadm_id, k=RAG_K)
+    log_cost_sample("rag_knn", hadm_id, rag_latency_ms, source="live")
     rag_label = {"Readmit <=30d": rag_prob, "No readmit": 1 - rag_prob}
     neighbors_df = neighbors_df.rename(columns={"readmit_30d": "readmitted_30d"})
     neighbors_df["similarity"] = neighbors_df["similarity"].round(3)
@@ -127,9 +97,17 @@ def run_admission(hadm_id: int):
         neighbors_df,
     )
 
-    text_prob = predict_text_confidence(hadm_id)
+    try:
+        text_prob, text_latency_ms = predict_text(hadm_id, TEXT_ADAPTER_DIR)
+    except RuntimeError as e:
+        raise gr.Error(str(e))
+    log_cost_sample("text_distilbert_lora", hadm_id, text_latency_ms, source="live")
     text_label = {"Readmit <=30d": text_prob, "No readmit": 1 - text_prob}
     yield (summary_md, note_text, ground_truth_md, structured_label, text_label, rag_label, neighbors_df)
+
+
+def refresh_dashboard():
+    return build_dashboard_data()
 
 
 with gr.Blocks(title="MIMIC-III Readmission Demo") as demo:
@@ -140,66 +118,83 @@ with gr.Blocks(title="MIMIC-III Readmission Demo") as demo:
         "Clinical Database *Demo*, now compared against a k-NN retrieval classifier "
         "over note embeddings, and should never inform real clinical decisions."
     )
-    with gr.Row():
-        dropdown = gr.Dropdown(choices=HADM_IDS, label="Select admission (hadm_id)")
-        random_btn = gr.Button("Random admission")
 
-    model_toggle = gr.CheckboxGroup(
-        choices=["Structured (XGBoost)", "Text (DistilBERT + LoRA)", "Retrieval k-NN"],
-        value=["Structured (XGBoost)", "Text (DistilBERT + LoRA)", "Retrieval k-NN"],
-        label="Show/hide model predictions",
-    )
+    with gr.Tab("Patient Explorer"):
+        with gr.Row():
+            dropdown = gr.Dropdown(choices=HADM_IDS, label="Select admission (hadm_id)")
+            random_btn = gr.Button("Random admission")
 
-    with gr.Row():
-        summary_out = gr.Markdown(label="Patient / admission summary")
-        with gr.Column():
-            gr.Markdown(
-                "**Note:** this text is SYNTHETIC, generated for pipeline "
-                "development (see `data/generate_mock_noteevents.py`) -- it is "
-                "NOT a real clinical note and carries a deliberate artificial "
-                "correlation with the label. Treat the text model's result as a "
-                "pipeline demonstration, not a real text-based finding."
-            )
-            note_out = gr.Textbox(label="Discharge note (synthetic)", lines=8, interactive=False)
-
-    ground_truth_out = gr.Markdown()
-    with gr.Row():
-        with gr.Column(visible=True) as structured_col:
-            structured_out = gr.Label(label="Structured model (XGBoost)")
-        with gr.Column(visible=True) as text_col:
-            text_out = gr.Label(label="Text model (DistilBERT + LoRA)")
-        with gr.Column(visible=True) as rag_col:
-            rag_out = gr.Label(label="Retrieval k-NN model")
-            gr.Markdown(
-                "**Retrieved evidence** -- top-k most similar SYNTHETIC notes "
-                "(excluding this admission). Notes were generated with a "
-                "deliberate label-correlated phrasing pattern (see "
-                "`data/generate_mock_noteevents.py`), so retrieval trivially "
-                "finds notes sharing that injected phrasing -- expected "
-                "pipeline behavior, not a discovered clinical insight."
-            )
-            rag_evidence_out = gr.Dataframe(
-                label=f"Top-{RAG_K} nearest neighbor notes",
-                headers=["hadm_id", "similarity", "readmitted_30d"],
-            )
-
-    outputs = [summary_out, note_out, ground_truth_out, structured_out, text_out, rag_out, rag_evidence_out]
-    dropdown.change(run_admission, inputs=dropdown, outputs=outputs)
-    random_btn.click(lambda: random.choice(HADM_IDS), outputs=dropdown).then(
-        run_admission, inputs=dropdown, outputs=outputs
-    )
-    demo.load(lambda: random.choice(HADM_IDS), outputs=dropdown).then(
-        run_admission, inputs=dropdown, outputs=outputs
-    )
-
-    def toggle_columns(selected: list[str]):
-        return (
-            gr.update(visible="Structured (XGBoost)" in selected),
-            gr.update(visible="Text (DistilBERT + LoRA)" in selected),
-            gr.update(visible="Retrieval k-NN" in selected),
+        model_toggle = gr.CheckboxGroup(
+            choices=["Structured (XGBoost)", "Text (DistilBERT + LoRA)", "Retrieval k-NN"],
+            value=["Structured (XGBoost)", "Text (DistilBERT + LoRA)", "Retrieval k-NN"],
+            label="Show/hide model predictions",
         )
 
-    model_toggle.change(toggle_columns, inputs=model_toggle, outputs=[structured_col, text_col, rag_col])
+        with gr.Row():
+            summary_out = gr.Markdown(label="Patient / admission summary")
+            with gr.Column():
+                gr.Markdown(
+                    "**Note:** this text is SYNTHETIC, generated for pipeline "
+                    "development (see `data/generate_mock_noteevents.py`) -- it is "
+                    "NOT a real clinical note and carries a deliberate artificial "
+                    "correlation with the label. Treat the text model's result as a "
+                    "pipeline demonstration, not a real text-based finding."
+                )
+                note_out = gr.Textbox(label="Discharge note (synthetic)", lines=8, interactive=False)
+
+        ground_truth_out = gr.Markdown()
+        with gr.Row():
+            with gr.Column(visible=True) as structured_col:
+                structured_out = gr.Label(label="Structured model (XGBoost)")
+            with gr.Column(visible=True) as text_col:
+                text_out = gr.Label(label="Text model (DistilBERT + LoRA)")
+            with gr.Column(visible=True) as rag_col:
+                rag_out = gr.Label(label="Retrieval k-NN model")
+                gr.Markdown(
+                    "**Retrieved evidence** -- top-k most similar SYNTHETIC notes "
+                    "(excluding this admission). Notes were generated with a "
+                    "deliberate label-correlated phrasing pattern (see "
+                    "`data/generate_mock_noteevents.py`), so retrieval trivially "
+                    "finds notes sharing that injected phrasing -- expected "
+                    "pipeline behavior, not a discovered clinical insight."
+                )
+                rag_evidence_out = gr.Dataframe(
+                    label=f"Top-{RAG_K} nearest neighbor notes",
+                    headers=["hadm_id", "similarity", "readmitted_30d"],
+                )
+
+        outputs = [summary_out, note_out, ground_truth_out, structured_out, text_out, rag_out, rag_evidence_out]
+        dropdown.change(run_admission, inputs=dropdown, outputs=outputs)
+        random_btn.click(lambda: random.choice(HADM_IDS), outputs=dropdown).then(
+            run_admission, inputs=dropdown, outputs=outputs
+        )
+        demo.load(lambda: random.choice(HADM_IDS), outputs=dropdown).then(
+            run_admission, inputs=dropdown, outputs=outputs
+        )
+
+        def toggle_columns(selected: list[str]):
+            return (
+                gr.update(visible="Structured (XGBoost)" in selected),
+                gr.update(visible="Text (DistilBERT + LoRA)" in selected),
+                gr.update(visible="Retrieval k-NN" in selected),
+            )
+
+        model_toggle.change(toggle_columns, inputs=model_toggle, outputs=[structured_col, text_col, rag_col])
+
+    with gr.Tab("Cost / Latency Dashboard"):
+        gr.Markdown(
+            "**Illustrative only** -- this demo has no billed inference API. "
+            "\"Cost\" is latency converted through an assumed reference compute "
+            "rate (`src/eval/cost_logger.py`), not real billing data. Seeded by "
+            "a one-time benchmark (`uv run python -m src.eval.run_cost_benchmark`) "
+            "and grows with every prediction made in the Patient Explorer tab."
+        )
+        dashboard_refresh_btn = gr.Button("Refresh")
+        dashboard_table = gr.Dataframe(label="Model comparison")
+        dashboard_plot = gr.Plot(label="Latency vs. accuracy")
+
+        dashboard_refresh_btn.click(refresh_dashboard, outputs=[dashboard_table, dashboard_plot])
+        demo.load(refresh_dashboard, outputs=[dashboard_table, dashboard_plot])
 
 if __name__ == "__main__":
     demo.launch()
